@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced PiP Tool</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <div id="alert-box" class="alert-hidden"></div> <button id="themeToggle" class="btn-icon">🌓 Theme</button>
+    </header>
+
+    <div id="drop-zone">
+        <p id="label-drop"></p>
+        <input type="file" id="fileInput" accept="image/*, video/*" multiple style="display: none;">
+    </div>
+
+    <div id="preview-wrapper">
+        <button id="prevBtn" class="nav-btn" hidden>&#10094;</button>
+        <div id="preview-container">
+            <span id="placeholder-text"></span>
+            <canvas id="canvas"></canvas>
+        </div>
+        <button id="nextBtn" class="nav-btn" hidden>&#10095;</button>
+    </div>
+
+    <div class="button-group">
+        <button id="pipBtn" class="btn-primary" disabled></button>
+        <button id="resetBtn" class="btn-reset"></button>
+    </div>
+</div>
+
+<video id="hiddenVideo" autoplay muted playsinline loop></video>
+
+<script src="script.js"></script>
+</body>
+</html>
