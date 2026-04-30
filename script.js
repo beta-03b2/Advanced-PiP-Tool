@@ -1,6 +1,7 @@
 /**
  * --- 1. 初期設定とUI ---
  */
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const lang = navigator.language.startsWith('ja') ? 'ja' : 'en';
 const ui = {
     ja: {
@@ -8,14 +9,16 @@ const ui = {
         placeholder: "ここにプレビューが表示されます",
         pip: "PiPを開始",
         reset: "リセット",
-        duplicate: "このファイルは既に読み込まれています"
+        duplicate: "このファイルは既に読み込まれています",
+        iosNote: "【iPhone/iPad】動画の左上アイコンからPiPを開始してください。15秒送り/戻しで切り替え可能です。"
     },
     en: {
         drop: "Add images or videos",
         placeholder: "Preview appears here",
         pip: "Start PiP",
         reset: "Reset",
-        duplicate: "Duplicate file detected"
+        duplicate: "Duplicate file detected",
+        iosNote: "【iOS】Use the top-left icon for PiP. 15s seek buttons will switch items."
     }
 };
 
@@ -35,6 +38,15 @@ const els = {
 };
 
 Object.keys(ui[lang]).forEach(key => { if (els[key]) els[key].textContent = ui[lang][key]; });
+
+// iOS用案内表示
+if (isIOS) {
+    els.pip.style.display = 'none';
+    const note = document.createElement('p');
+    note.style.cssText = "font-size: 11px; opacity: 0.7; margin-top: 8px; text-align: center;";
+    note.textContent = ui[lang].iosNote;
+    els.container.after(note);
+}
 
 /**
  * --- 2. 状態管理 ---
@@ -169,7 +181,7 @@ function updateMaxSize(w, h) {
 }
 
 function finalizeMediaLoad() {
-    els.placeholder.style.display = 'none';
+    if (els.placeholder) els.placeholder.style.display = 'none';
     els.pip.disabled = false;
     showMedia(currentIndex);
     updateNavButtons();
@@ -186,8 +198,6 @@ function showAlert(msg) {
  */
 async function showMedia(index) {
     if (mediaItems.length === 0) return;
-    
-    // PiPが有効かチェックしておく
     const isPipActive = !!document.pictureInPictureElement;
     
     currentIndex = (index + mediaItems.length) % mediaItems.length;
@@ -202,15 +212,18 @@ async function showMedia(index) {
 
     if (item.type === 'image') {
         els.canvas.style.display = 'block';
-        els.canvas.width = maxBaseWidth;
-        els.canvas.height = maxBaseHeight;
+        els.canvas.width = maxBaseWidth || 1280;
+        els.canvas.height = maxBaseHeight || 720;
         ctx.fillStyle = "#000000";
-        ctx.fillRect(0, 0, maxBaseWidth, maxBaseHeight);
+        ctx.fillRect(0, 0, els.canvas.width, els.canvas.height);
         const img = item.el;
-        const ratio = Math.min(maxBaseWidth / img.width, maxBaseHeight / img.height);
-        ctx.drawImage(img, (maxBaseWidth - img.width * ratio) / 2, (maxBaseHeight - img.height * ratio) / 2, img.width * ratio, img.height * ratio);
+        const ratio = Math.min(els.canvas.width / img.width, els.canvas.height / img.height);
+        ctx.drawImage(img, (els.canvas.width - img.width * ratio) / 2, (els.canvas.height - img.height * ratio) / 2, img.width * ratio, img.height * ratio);
         
-        if (!els.video.srcObject) els.video.srcObject = els.canvas.captureStream(30);
+        // 画像をPiP可能にするため、Canvasからストリームを取得して隠しビデオに流す
+        if (!els.video.srcObject) {
+            els.video.srcObject = els.canvas.captureStream(30);
+        }
         els.video.loop = true;
         els.video.play().catch(()=>{});
     } else {
@@ -222,14 +235,13 @@ async function showMedia(index) {
     updateMediaSession();
     updateNavButtons();
 
-    // 重要: PiPが起動中なら、切り替えた瞬間に新しいターゲットでPiPを上書きする
     if (isPipActive) {
         try {
             const target = item.type === 'video' ? item.el : els.video;
-            await target.requestPictureInPicture();
-        } catch (e) {
-            console.warn("Auto PiP update failed:", e);
-        }
+            if (document.pictureInPictureElement !== target) {
+                await target.requestPictureInPicture();
+            }
+        } catch (e) { console.warn(e); }
     }
 }
 
@@ -247,7 +259,7 @@ function updateMediaSession() {
     const updatePosition = () => {
         if (targetVideo.duration && !isNaN(targetVideo.duration)) {
             navigator.mediaSession.setPositionState({
-                duration: targetVideo.duration || 60,
+                duration: targetVideo.duration,
                 playbackRate: targetVideo.playbackRate,
                 position: targetVideo.currentTime
             });
@@ -258,8 +270,11 @@ function updateMediaSession() {
     navigator.mediaSession.setActionHandler('pause', () => targetVideo.pause());
     navigator.mediaSession.setActionHandler('previoustrack', () => showMedia(currentIndex - 1));
     navigator.mediaSession.setActionHandler('nexttrack', () => showMedia(currentIndex + 1));
-    navigator.mediaSession.setActionHandler('seekbackward', () => { targetVideo.currentTime -= 10; updatePosition(); });
-    navigator.mediaSession.setActionHandler('seekforward', () => { targetVideo.currentTime += 10; updatePosition(); });
+    
+    // iOS/モバイル対策：15秒送り・戻しをスキップとして機能させる
+    navigator.mediaSession.setActionHandler('seekbackward', () => showMedia(currentIndex - 1));
+    navigator.mediaSession.setActionHandler('seekforward', () => showMedia(currentIndex + 1));
+    
     navigator.mediaSession.setActionHandler('seekto', (details) => {
         targetVideo.currentTime = details.seekTime;
         updatePosition();
@@ -290,9 +305,7 @@ els.pip.onclick = async () => {
 
         await targetVideo.play();
         await targetVideo.requestPictureInPicture();
-    } catch (e) { 
-        console.error("PiP Error:", e);
-    }
+    } catch (e) { console.error("PiP Error:", e); }
 };
 
 /**
