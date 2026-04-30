@@ -1,6 +1,8 @@
 /**
- * --- 1. 初期設定とUI ---
+ * --- 1. デバイス判定 & 初期設定 ---
  */
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 const lang = navigator.language.startsWith('ja') ? 'ja' : 'en';
 const ui = {
     ja: {
@@ -8,14 +10,16 @@ const ui = {
         placeholder: "ここにプレビューが表示されます",
         pip: "PiPを開始",
         reset: "リセット",
-        duplicate: "このファイルは既に読み込まれています"
+        duplicate: "このファイルは既に読み込まれています",
+        iosNote: "※iOSでは動画内の左上のアイコンからPiPを開始してください"
     },
     en: {
         drop: "Add images or videos",
         placeholder: "Preview appears here",
         pip: "Start PiP",
         reset: "Reset",
-        duplicate: "Duplicate file detected"
+        duplicate: "Duplicate file detected",
+        iosNote: "Note: On iOS, tap the icon in the top-left of the video to start PiP"
     }
 };
 
@@ -25,14 +29,20 @@ const els = {
     pip: document.getElementById('pipBtn'),
     reset: document.getElementById('resetBtn'),
     canvas: document.getElementById('canvas'),
-    video: document.getElementById('hiddenVideo'), 
     fileInput: document.getElementById('fileInput'),
     alert: document.getElementById('alert-box'),
-    themeToggle: document.getElementById('themeToggle'),
-    prev: document.getElementById('prevBtn'),
-    next: document.getElementById('nextBtn'),
     container: document.getElementById('preview-container')
 };
+
+// iOSの場合は独自PiPボタンを隠し、案内を出す
+if (isIOS) {
+    els.pip.style.display = 'none';
+    const note = document.createElement('p');
+    note.textContent = ui[lang].iosNote;
+    note.style.fontSize = '12px';
+    note.style.opacity = '0.7';
+    els.container.after(note);
+}
 
 Object.keys(ui[lang]).forEach(key => { if (els[key]) els[key].textContent = ui[lang][key]; });
 
@@ -42,26 +52,24 @@ Object.keys(ui[lang]).forEach(key => { if (els[key]) els[key].textContent = ui[l
 let loadedHashes = new Set();
 let mediaItems = []; 
 let currentIndex = 0;
-let ctx = els.canvas.getContext('2d');
-let maxBaseWidth = 0;
-let maxBaseHeight = 0;
+let maxBaseWidth = 1280; // iOS安定用の基準サイズ
+let maxBaseHeight = 720;
 
 /**
- * --- 3. データベース ---
+ * --- 3. データベース & ハッシュ ---
  */
-const DB_NAME = "PiPAppDB";
+const DB_NAME = "PiPAppDB_v2";
 const DB_VERSION = 1;
 
 async function getDB() {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
         request.onupgradeneeded = (e) => {
             const db = e.target.result;
             if (!db.objectStoreNames.contains("settings")) db.createObjectStore("settings");
-            if (!db.objectStoreNames.contains("images")) db.createObjectStore("images", { keyPath: "hash" });
+            if (!db.objectStoreNames.contains("media")) db.createObjectStore("media", { keyPath: "hash" });
         };
         request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
     });
 }
 
@@ -71,255 +79,158 @@ async function calculateHash(file) {
     return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function loadSavedData() {
-    try {
-        const db = await getDB();
-        const themeTx = db.transaction("settings", "readonly");
-        const themeReq = themeTx.objectStore("settings").get("theme");
-        themeReq.onsuccess = () => { if (themeReq.result === 'dark') document.body.classList.add('dark-mode'); };
-
-        const imgTx = db.transaction("images", "readonly");
-        const imgReq = imgTx.objectStore("images").getAll();
-        imgReq.onsuccess = () => {
-            const savedData = imgReq.result;
-            if (savedData && savedData.length > 0) {
-                savedData.forEach(item => loadedHashes.add(item.hash));
-                renderInitialMedia(savedData.map(item => item.blob));
-            }
+/**
+ * --- 4. 画像をiOS用「動画」に変換する関数 ---
+ */
+async function imageToVideoBlob(file) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.src = URL.createObjectURL(file);
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const tctx = canvas.getContext('2d');
+            tctx.drawImage(img, 0, 0);
+            
+            const stream = canvas.captureStream(1);
+            const recorder = new MediaRecorder(stream, { mimeType: 'video/mp4' }); // iOS対応形式
+            const chunks = [];
+            recorder.ondataavailable = e => chunks.push(e.data);
+            recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/mp4' }));
+            
+            recorder.start();
+            setTimeout(() => recorder.stop(), 1000); // 1秒の動画にする
         };
-    } catch (e) { console.error("Load failed:", e); }
+    });
 }
-
-loadSavedData();
 
 /**
- * --- 4. ファイル処理 ---
+ * --- 5. メディア処理 ---
  */
-els.themeToggle.onclick = () => {
-    const isDark = document.body.classList.toggle('dark-mode');
-    saveTheme(isDark ? 'dark' : 'light');
-};
-
-async function saveTheme(mode) {
-    const db = await getDB();
-    const tx = db.transaction("settings", "readwrite");
-    tx.objectStore("settings").put(mode, "theme");
-}
-
+els.fileInput.onchange = (e) => handleFiles(e.target.files);
 document.getElementById('drop-zone').onclick = () => {
     els.fileInput.accept = "image/*,video/*";
     els.fileInput.click();
 };
 
-els.fileInput.onchange = (e) => handleFiles(e.target.files);
-
 async function handleFiles(files) {
-    const fileArray = Array.from(files);
-    let hasDuplicate = false;
     const db = await getDB();
-
-    for (const file of fileArray) {
+    for (const file of Array.from(files)) {
         const hash = await calculateHash(file);
-        if (loadedHashes.has(hash)) {
-            hasDuplicate = true;
-            continue;
-        }
+        if (loadedHashes.has(hash)) continue;
+        
         loadedHashes.add(hash);
-        const tx = db.transaction("images", "readwrite");
-        tx.objectStore("images").put({ hash: hash, blob: file });
-        createMediaObject(file);
-    }
-    if (hasDuplicate) showAlert(ui[lang].duplicate);
-    els.fileInput.value = "";
-}
+        let finalBlob = file;
 
-function createMediaObject(file) {
-    const url = URL.createObjectURL(file);
-    if (file.type.startsWith('video/')) {
-        const video = document.createElement('video');
-        video.src = url;
-        video.controls = true;
-        video.playsInline = true;
-        video.className = "preview-video-element";
-        video.style.maxWidth = "100%";
-        video.style.maxHeight = "100%";
-        video.onloadedmetadata = () => {
-            updateMaxSize(video.videoWidth, video.videoHeight);
-            mediaItems.push({ type: 'video', el: video });
-            finalizeMediaLoad();
-        };
-    } else if (file.type.startsWith('image/')) {
-        const img = new Image();
-        img.src = url;
-        img.onload = () => {
-            updateMaxSize(img.width, img.height);
-            mediaItems.push({ type: 'image', el: img });
-            finalizeMediaLoad();
-        };
+        // iOSかつ画像の場合、動画に変換
+        if (isIOS && file.type.startsWith('image/')) {
+            finalBlob = await imageToVideoBlob(file);
+        }
+
+        const tx = db.transaction("media", "readwrite");
+        tx.objectStore("media").put({ hash, blob: finalBlob, type: finalBlob.type });
+        createMediaElement(finalBlob);
     }
 }
 
-function renderInitialMedia(blobs) {
-    blobs.forEach(blob => createMediaObject(blob));
-}
-
-function updateMaxSize(w, h) {
-    if (w > maxBaseWidth) maxBaseWidth = w;
-    if (h > maxBaseHeight) maxBaseHeight = h;
-}
-
-function finalizeMediaLoad() {
-    els.placeholder.style.display = 'none';
-    els.pip.disabled = false;
-    showMedia(currentIndex);
-    updateNavButtons();
-}
-
-function showAlert(msg) {
-    els.alert.textContent = msg;
-    els.alert.classList.remove('alert-hidden');
-    setTimeout(() => els.alert.classList.add('alert-hidden'), 3000);
+function createMediaElement(blob) {
+    const url = URL.createObjectURL(blob);
+    const video = document.createElement('video');
+    video.src = url;
+    video.controls = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.style.width = "100%";
+    video.style.display = "none";
+    
+    video.onloadedmetadata = () => {
+        mediaItems.push({ el: video });
+        if (mediaItems.length === 1) showMedia(0);
+        els.placeholder.style.display = 'none';
+        updateNavButtons();
+    };
+    els.container.appendChild(video);
 }
 
 /**
- * --- 5. 表示・切り替えロジック ---
+ * --- 6. 表示 & MediaSession (切り替えロジック) ---
  */
-async function showMedia(index) {
+function showMedia(index) {
     if (mediaItems.length === 0) return;
-    
-    // PiPが有効かチェックしておく
-    const isPipActive = !!document.pictureInPictureElement;
-    
+    const oldIndex = currentIndex;
     currentIndex = (index + mediaItems.length) % mediaItems.length;
-    const item = mediaItems[currentIndex];
 
-    mediaItems.forEach(i => {
-        if (i.type === 'video') {
-            i.el.pause();
-            if (i.el.parentNode === els.container) els.container.removeChild(i.el);
+    mediaItems.forEach((item, i) => {
+        if (i === currentIndex) {
+            item.el.style.display = "block";
+            item.el.play().catch(() => {});
+        } else {
+            item.el.style.display = "none";
+            item.el.pause();
         }
     });
 
-    if (item.type === 'image') {
-        els.canvas.style.display = 'block';
-        els.canvas.width = maxBaseWidth;
-        els.canvas.height = maxBaseHeight;
-        ctx.fillStyle = "#000000";
-        ctx.fillRect(0, 0, maxBaseWidth, maxBaseHeight);
-        const img = item.el;
-        const ratio = Math.min(maxBaseWidth / img.width, maxBaseHeight / img.height);
-        ctx.drawImage(img, (maxBaseWidth - img.width * ratio) / 2, (maxBaseHeight - img.height * ratio) / 2, img.width * ratio, img.height * ratio);
-        
-        if (!els.video.srcObject) els.video.srcObject = els.canvas.captureStream(30);
-        els.video.loop = true;
-        els.video.play().catch(()=>{});
-    } else {
-        els.canvas.style.display = 'none';
-        els.container.appendChild(item.el);
-        item.el.play().catch(() => {});
-    }
-
     updateMediaSession();
-    updateNavButtons();
-
-    // 重要: PiPが起動中なら、切り替えた瞬間に新しいターゲットでPiPを上書きする
-    if (isPipActive) {
-        try {
-            const target = item.type === 'video' ? item.el : els.video;
-            await target.requestPictureInPicture();
-        } catch (e) {
-            console.warn("Auto PiP update failed:", e);
-        }
-    }
 }
 
 function updateMediaSession() {
     if (!('mediaSession' in navigator)) return;
-
-    const item = mediaItems[currentIndex];
-    const targetVideo = item.type === 'video' ? item.el : els.video;
+    const currentVideo = mediaItems[currentIndex].el;
 
     navigator.mediaSession.metadata = new MediaMetadata({
-        title: `${item.type === 'video' ? 'Video' : 'Image'} ${currentIndex + 1} / ${mediaItems.length}`,
-        artist: 'Media PiP Player'
+        title: `Item ${currentIndex + 1} / ${mediaItems.length}`,
+        artist: 'Mobile PiP'
     });
 
-    const updatePosition = () => {
-        if (targetVideo.duration && !isNaN(targetVideo.duration)) {
+    // 「次へ」「前へ」の標準設定（PC/Android用）
+    navigator.mediaSession.setActionHandler('previoustrack', () => showMedia(currentIndex - 1));
+    navigator.mediaSession.setActionHandler('nexttrack', () => showMedia(currentIndex + 1));
+
+    // 「10/15秒送り・戻し」を「切り替え」に割り当てる (iOS PiP対策)
+    navigator.mediaSession.setActionHandler('seekbackward', () => showMedia(currentIndex - 1));
+    navigator.mediaSession.setActionHandler('seekforward', () => showMedia(currentIndex + 1));
+
+    // 再生位置を報告 (iOSパネル表示に必要)
+    currentVideo.ontimeupdate = () => {
+        if (currentVideo.duration) {
             navigator.mediaSession.setPositionState({
-                duration: targetVideo.duration || 60,
-                playbackRate: targetVideo.playbackRate,
-                position: targetVideo.currentTime
+                duration: currentVideo.duration,
+                playbackRate: currentVideo.playbackRate,
+                position: currentVideo.currentTime
             });
         }
     };
-
-    navigator.mediaSession.setActionHandler('play', () => targetVideo.play());
-    navigator.mediaSession.setActionHandler('pause', () => targetVideo.pause());
-    navigator.mediaSession.setActionHandler('previoustrack', () => showMedia(currentIndex - 1));
-    navigator.mediaSession.setActionHandler('nexttrack', () => showMedia(currentIndex + 1));
-    navigator.mediaSession.setActionHandler('seekbackward', () => { targetVideo.currentTime -= 10; updatePosition(); });
-    navigator.mediaSession.setActionHandler('seekforward', () => { targetVideo.currentTime += 10; updatePosition(); });
-    navigator.mediaSession.setActionHandler('seekto', (details) => {
-        targetVideo.currentTime = details.seekTime;
-        updatePosition();
-    });
-
-    targetVideo.ontimeupdate = updatePosition;
 }
-
-function updateNavButtons() {
-    els.prev.hidden = els.next.hidden = (mediaItems.length <= 1);
-}
-
-els.prev.onclick = (e) => { e.stopPropagation(); showMedia(currentIndex - 1); };
-els.next.onclick = (e) => { e.stopPropagation(); showMedia(currentIndex + 1); };
 
 /**
- * --- 6. PiP制御 ---
+ * --- 7. その他操作 ---
  */
+function updateNavButtons() {
+    document.getElementById('prevBtn').hidden = document.getElementById('nextBtn').hidden = mediaItems.length <= 1;
+}
+
+document.getElementById('prevBtn').onclick = () => showMedia(currentIndex - 1);
+document.getElementById('nextBtn').onclick = () => showMedia(currentIndex + 1);
+
 els.pip.onclick = async () => {
-    try {
-        const item = mediaItems[currentIndex];
-        const targetVideo = item.type === 'video' ? item.el : els.video;
-
-        if (document.pictureInPictureElement) {
-            await document.exitPictureInPicture();
-            return;
-        }
-
-        await targetVideo.play();
-        await targetVideo.requestPictureInPicture();
-    } catch (e) { 
-        console.error("PiP Error:", e);
+    if (mediaItems[currentIndex]) {
+        try {
+            await mediaItems[currentIndex].el.requestPictureInPicture();
+        } catch (e) { console.error(e); }
     }
 };
 
-/**
- * --- 7. リセット ---
- */
 els.reset.onclick = async () => {
-    if (document.pictureInPictureElement) await document.exitPictureInPicture().catch(()=>{});
-
+    if (document.pictureInPictureElement) await document.exitPictureInPicture();
     mediaItems.forEach(item => {
-        if (item.type === 'video') {
-            item.el.pause();
-            item.el.src = "";
-            if (item.el.parentNode === els.container) els.container.removeChild(item.el);
-        }
+        item.el.pause();
+        item.el.src = "";
+        item.el.remove();
     });
-
     mediaItems = [];
     loadedHashes.clear();
-    maxBaseWidth = 0; maxBaseHeight = 0; currentIndex = 0;
-    els.video.pause(); els.video.srcObject = null;
-    ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
-    els.canvas.style.display = 'block';
     els.placeholder.style.display = 'block';
-    els.pip.disabled = true;
-    updateNavButtons();
-
     const db = await getDB();
-    const tx = db.transaction("images", "readwrite");
-    tx.objectStore("images").clear();
+    db.transaction("media", "readwrite").objectStore("media").clear();
 };
