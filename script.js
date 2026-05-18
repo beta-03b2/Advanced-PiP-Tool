@@ -95,6 +95,13 @@ loadSavedData();
 /**
  * --- 4. ファイル処理 ---
  */
+
+const dropzone = document.getElementById('drop-zone');
+
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  handleFiles(e.dataTransfer.files);
+});
 els.themeToggle.onclick = () => {
     const isDark = document.body.classList.toggle('dark-mode');
     saveTheme(isDark ? 'dark' : 'light');
@@ -106,7 +113,7 @@ async function saveTheme(mode) {
     tx.objectStore("settings").put(mode, "theme");
 }
 
-document.getElementById('drop-zone').onclick = () => {
+dropzone.onclick = () => {
     els.fileInput.accept = "image/*,video/*";
     els.fileInput.click();
 };
